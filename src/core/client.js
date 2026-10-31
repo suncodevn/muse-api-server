@@ -1588,7 +1588,7 @@ class MuseClient extends EventEmitter {
       // 3. Merge custom items if provided
       if (Array.isArray(options.items)) {
         for (const it of options.items) {
-          if (!items.some(ex => ex.data_base64 && ex.data_base64 === it.data_base64)) {
+          if (options.preserveItemOrder || !items.some(ex => ex.data_base64 && ex.data_base64 === it.data_base64)) {
             items.push(it);
           }
         }
@@ -1710,7 +1710,11 @@ class MuseClient extends EventEmitter {
     const duration = parseInt(options.duration, 10) || 5;
 
     let formattedPrompt = `Create a high quality motion video based on this prompt: "${prompt}". Aspect ratio: ${aspectRatio}, duration: ${duration}s. Generate the video now.`;
-    if (refImage) {
+    const refImages = options.ref_images || [];
+    if (refImages.length) {
+      const descriptions = refImages.map((item, index) => `Image ${index + 1}: ${JSON.stringify({ label: item.label || '', role: item.role || '' })}`).join('\n');
+      formattedPrompt += `\nUse all ${refImages.length} attached images in their listed order as visual references. Labels and roles are guidance, not dedicated model controls:\n${descriptions}`;
+    } else if (refImage) {
       formattedPrompt = `Based on the attached reference image (Image-to-Video), create a smooth motion video: "${prompt}". Aspect ratio: ${aspectRatio}, duration: ${duration}s.`;
     } else if (refVideo) {
       formattedPrompt = `Based on the attached reference video (Video-to-Video), regenerate a motion video with dynamic effects: "${prompt}". Aspect ratio: ${aspectRatio}, duration: ${duration}s.`;
@@ -1721,6 +1725,8 @@ class MuseClient extends EventEmitter {
       new_session: true,
       ref_image: refImage,
       ref_video: refVideo,
+      preserveItemOrder: true,
+      items: refImages.map(item => ({ type: 'image', mime_type: item.image.mime_type, data_base64: item.image.data_base64 })),
       timeout: options.timeout || 180000,
       waitForKind: 'video',
       signal: options.signal,

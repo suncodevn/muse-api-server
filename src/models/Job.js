@@ -26,6 +26,11 @@ const JobSchema = new mongoose.Schema(
     },
     reference: {
       image_file_id: { type: String, default: null },
+      images: { type: [new mongoose.Schema({
+        file_id: { type: String, required: true },
+        label: { type: String, default: '', maxlength: 120 },
+        role: { type: String, default: '', maxlength: 240 }
+      }, { _id: false })], default: undefined },
       video_file_id: { type: String, default: null }
     },
     // Upstream accounts that already failed this job (skipped on retry).

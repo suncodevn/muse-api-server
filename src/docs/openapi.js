@@ -485,6 +485,13 @@ function buildOpenApiSpec() {
             aspect_ratio: { type: 'string', enum: ['16:9', '9:16', '1:1'], default: '16:9' },
             duration: { type: 'integer', minimum: 3, maximum: 10, default: 5, description: 'Seconds.' },
             reference_image: ref('Reference'),
+            reference_images: {
+              type: 'array', minItems: 1, maxItems: 100,
+              description: 'Ordered references; 100 is a local resource cap, not verified upstream capacity. Mutually exclusive with reference_image and reference_video. Combined decoded image bytes must fit MAX_IMAGE_MB (default 20 MiB). Labels/roles are prompt guidance.',
+              items: { type: 'object', required: ['image'], additionalProperties: false, properties: {
+                image: ref('Reference'), label: { type: 'string', maxLength: 120 }, role: { type: 'string', maxLength: 240 }
+              } }
+            },
             reference_video: ref('Reference'),
             async: { type: 'boolean', default: true },
             webhook_url: { type: 'string', format: 'uri' },
