@@ -46,6 +46,7 @@ function serializeJob(doc) {
     id: doc._id,
     object: 'job',
     type: doc.type,
+    generation_session_id: doc.generation_session_id || null,
     status: doc.status,
     progress: doc.progress ?? 0,
     progress_text: doc.progress_text || null,
@@ -56,6 +57,7 @@ function serializeJob(doc) {
     },
     reference: {
       image_file_id: doc.reference?.image_file_id || null,
+      ...(doc.reference?.images?.length ? { images: doc.reference.images.map(item => ({ file_id: item.file_id, label: item.label, role: item.role })) } : {}),
       ...(doc.type === 'video' ? { video_file_id: doc.reference?.video_file_id || null } : {})
     },
     output,

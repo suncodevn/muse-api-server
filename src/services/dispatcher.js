@@ -31,6 +31,7 @@ const { Job, TERMINAL_STATUSES } = require('../models');
 const { pool } = require('./pool');
 const storage = require('./storage');
 const media = require('./media');
+const generationSessions = require('./generationSessions');
 const usage = require('./usage');
 const webhook = require('./webhook');
 const { serializeJob } = require('../serializers');
@@ -103,7 +104,9 @@ class Dispatcher extends EventEmitter {
         if (!ctx) continue;
         ctx.controller.abort(new Error('Job interrupted by server shutdown.'));
         await Job.updateOne(this._executionFilter(ctx.job),
-          { $set: { status: 'queued', node_id: null, execution_id: null, account_id: null, progress: 0, progress_text: 'Re-queued after server restart', heartbeat_at: null }, $inc: { attempts: -1 } }
+          ctx.job.generation_session_id
+            ? { $set: { status: 'failed', completed_at: new Date(), error: { code: ErrorCodes.JOB_INTERRUPTED.code, message: 'Session turn interrupted; inspect before creating another job.' } } }
+            : { $set: { status: 'queued', node_id: null, execution_id: null, account_id: null, progress: 0, progress_text: 'Re-queued after server restart', heartbeat_at: null }, $inc: { attempts: -1 } }
         ).catch((err) => log.error({ err: err.message }, 'Failed to re-queue job'));
       }
     }
@@ -167,7 +170,7 @@ class Dispatcher extends EventEmitter {
    * Persists a new queued job.
    * @returns {Promise<{ job: object, replayed: boolean }>}
    */
-  async createJob({ apiKey, type, prompt, params, reference, webhookUrl, idempotencyKey, fingerprint, metadata }) {
+  async createJob({ apiKey, type, prompt, params, reference, webhookUrl, idempotencyKey, fingerprint, metadata, generationSessionId }) {
     const queueTimeout = config.jobs[type].queueTimeoutMs;
     try {
       const doc = await Job.create({
@@ -176,11 +179,12 @@ class Dispatcher extends EventEmitter {
         prompt,
         params,
         reference,
+        generation_session_id: generationSessionId || null,
         webhook: { url: webhookUrl || null },
         idempotency_key: idempotencyKey || null,
         request_fingerprint: fingerprint || null,
         metadata: metadata || {},
-        max_attempts: config.jobs.maxAttempts,
+        max_attempts: generationSessionId ? 1 : config.jobs.maxAttempts,
         queue_deadline: queueTimeout > 0 ? new Date(Date.now() + queueTimeout) : null
       });
       this.pendingCount += 1;
@@ -291,7 +295,7 @@ class Dispatcher extends EventEmitter {
 
   _claim(type) {
     const now = new Date();
-    const filter = { status: 'queued', type };
+    const filter = { status: 'queued', type, $and: [{ $or: [{ session_wait_until: null }, { session_wait_until: { $lte: now } }] }] };
     if (config.jobs[type].queueTimeoutMs > 0) {
       filter.$or = [{ queue_deadline: null }, { queue_deadline: { $gt: now } }];
     }
@@ -334,10 +338,11 @@ class Dispatcher extends EventEmitter {
 
     let outputFile = null;
     try {
+      if (job.generation_session_id) ctx.generationSession = await generationSessions.lock(job);
       const references = await this._loadReferences(job);
       ctx.controller.signal.throwIfAborted();
 
-      ctx.lease = await pool.acquire(job.type, { exclude: job.excluded_accounts || [], waitMs: ACQUIRE_WAIT_MS });
+      ctx.lease = await pool.acquire(job.type, { preferredAccountId: ctx.generationSession?.account_id || null, exclude: job.excluded_accounts || [], waitMs: ACQUIRE_WAIT_MS, signal: ctx.controller.signal });
       ctx.controller.signal.throwIfAborted();
       releaseAcquiring();
       ctx.progress = 3;
@@ -349,11 +354,14 @@ class Dispatcher extends EventEmitter {
         ctx.controller.signal.throwIfAborted();
       }
 
+      if (ctx.generationSession) await generationSessions.bind(job, ctx.lease.accountId);
+      const sessionOptions = ctx.generationSession ? { sessionId: ctx.generationSession.session_id, retainSession: true } : {};
       const isVideo = job.type === 'video';
       const timeout = config.jobs[job.type].timeoutMs;
       const onProgress = (text) => this._onProgress(ctx, text);
       const call = isVideo
         ? ctx.lease.client.generateVideo(job.prompt, {
+          ...sessionOptions,
           ref_image: references.image,
           ref_video: references.video,
           aspect_ratio: job.params?.aspect_ratio || undefined,
@@ -364,6 +372,7 @@ class Dispatcher extends EventEmitter {
           onProgress
         })
         : ctx.lease.client.generateImage(job.prompt, {
+          ...sessionOptions,
           ref_image: references.image,
           aspect_ratio: job.params?.aspect_ratio || undefined,
           timeout,
@@ -375,6 +384,9 @@ class Dispatcher extends EventEmitter {
       // Hard guard on top of the client's own timeout (covers the download phase).
       const result = await withTimeout(call, timeout + 60000, `${isVideo ? 'Video' : 'Image'} generation timed out.`, ctx.controller);
       ctx.controller.signal.throwIfAborted();
+      if (ctx.generationSession && result?.sessionId !== ctx.generationSession.session_id) {
+        throw new ApiError(ErrorCodes.CONVERSATION_UNAVAILABLE, { message: 'Upstream returned a different session; continuity could not be verified.' });
+      }
 
       if (!result?.success) {
         // The account worked; the model simply declined / produced nothing.
@@ -419,6 +431,10 @@ class Dispatcher extends EventEmitter {
       }
       log.info({ job: job._id, type: job.type, account: ctx.lease.accountId, ms: Date.now() - ctx.startedAt, bytes: result.buffer.length }, 'Job succeeded');
       outputFile = null; // The succeeded job now owns the stored file.
+      if (ctx.generationSession) {
+        await generationSessions.finish(job, true);
+        ctx.sessionFinished = true;
+      }
       this._finalize(updated);
     } catch (err) {
       releaseAcquiring();
@@ -428,6 +444,9 @@ class Dispatcher extends EventEmitter {
       if (ctx.lease && !ctx.lease.released) ctx.lease.release(ctx.canceled || this.stopping ? { success: true } : { success: false, error: apiError });
       await this._handleFailure(ctx, apiError);
     } finally {
+      if (ctx.generationSession && !ctx.sessionFinished) {
+        await generationSessions.finish(job, false).catch(err => log.error({ job: job._id, err: sanitize(err.message) }, 'Failed to release generation session'));
+      }
       clearInterval(progressTimer);
       releaseAcquiring();
       if (this.running.get(job._id) === ctx) this.running.delete(job._id);
@@ -479,16 +498,16 @@ class Dispatcher extends EventEmitter {
 
     // Capacity race (slot taken between scheduling and acquisition) or node
     // shutting down: put the job back without consuming an attempt.
-    if (apiError.code === 'capacity_exceeded' || apiError.code === 'service_shutting_down') {
+    if (apiError.code === 'capacity_exceeded' || apiError.code === 'service_shutting_down' || apiError.code === 'conversation_busy') {
       await Job.updateOne(guard, {
-        $set: { status: 'queued', node_id: null, execution_id: null, progress: 0, progress_text: 'Waiting in queue', heartbeat_at: null },
+        $set: { status: 'queued', node_id: null, execution_id: null, progress: 0, progress_text: 'Waiting in queue', heartbeat_at: null, session_wait_until: apiError.code === 'conversation_busy' ? new Date(Date.now() + 1000) : null },
         $inc: { attempts: -1 }
       }).catch(() => {});
       return;
     }
 
     const excluded = [...(job.excluded_accounts || []), ...(lease ? [lease.accountId] : [])];
-    const retryable = isAccountLevelFailure(apiError)
+    const retryable = !job.generation_session_id && isAccountLevelFailure(apiError)
       && job.attempts < job.max_attempts
       && !this.stopping
       && pool.hasAlternative(job.type, excluded);
@@ -557,7 +576,8 @@ class Dispatcher extends EventEmitter {
     for (const orphan of orphans) {
       if (orphan.node_id === this.nodeId && this.running.has(orphan._id)) continue;
       const guard = { _id: orphan._id, status: 'running', heartbeat_at: orphan.heartbeat_at, execution_id: orphan.execution_id ?? null };
-      if (orphan.attempts < orphan.max_attempts) {
+      if (orphan.generation_session_id) await generationSessions.finish(orphan, false);
+      if (!orphan.generation_session_id && orphan.attempts < orphan.max_attempts) {
         await Job.updateOne(guard, {
           $set: { status: 'queued', node_id: null, execution_id: null, account_id: null, progress: 0, progress_text: 'Re-queued after interruption', heartbeat_at: null, last_attempt_error: { code: ErrorCodes.JOB_INTERRUPTED.code, message: 'The node processing this job stopped responding.' } }
         });

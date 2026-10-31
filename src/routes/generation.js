@@ -63,6 +63,7 @@ async function submitGeneration(req, res, { type, sync, params, references, onSu
     await dispatcher.assertCanEnqueue(type, apiKey);
     const webhookUrl = body.webhook_url ? webhook.validateWebhookUrl(body.webhook_url) : null;
 
+    if (body.generation_session_id) await require('../services/generationSessions').get(body.generation_session_id, apiKey._id);
     const reference = { image_file_id: null, video_file_id: null };
     if (references.image) {
       const doc = await media.resolveReference(references.image, { expectedKind: 'image', apiKeyId: apiKey._id, param: 'reference_image' });
@@ -77,6 +78,7 @@ async function submitGeneration(req, res, { type, sync, params, references, onSu
       apiKey,
       type,
       prompt: body.prompt,
+      generationSessionId: body.generation_session_id,
       params,
       reference,
       webhookUrl,

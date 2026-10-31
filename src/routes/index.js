@@ -22,6 +22,7 @@ v1.use('/files', filesRouter);
 
 // Every other endpoint requires an API key and is rate limited per key.
 v1.use(authenticate, keyRateLimit);
+v1.use('/generation-sessions', require('./generationSessions'));
 v1.use('/images', imagesRouter);
 v1.use('/videos', videosRouter);
 v1.use('/jobs', jobsRouter);

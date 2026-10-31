@@ -127,6 +127,16 @@ function buildOpenApiSpec() {
       { name: 'Health', description: 'Liveness and readiness probes.' }
     ],
     paths: {
+      '/v1/generation-sessions': {
+        post: { tags: ['Generation sessions'], summary: 'Create a retained image/video project session (images or videos scope; no upstream generation)',
+          requestBody: { required: true, content: json({ type: 'object', additionalProperties: false, properties: { title: { type: 'string', maxLength: 200 } } }) },
+          responses: { 201: { description: 'Session created', content: json(ref('GenerationSession')) }, 401: resp('Error') } }
+      },
+      '/v1/generation-sessions/{id}': {
+        get: { tags: ['Generation sessions'], summary: 'Inspect an owned generation session',
+          parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
+          responses: { 200: { description: 'Session state (upstream account/session identifiers are private)', content: json(ref('GenerationSession')) }, 404: resp('Error') } }
+      },
       // ------------------------------------------------------------------ Chat
       '/v1/chat/completions': {
         post: {
@@ -448,11 +458,17 @@ function buildOpenApiSpec() {
           }
         },
 
+        GenerationSession: {
+          type: 'object', properties: { id: { type: 'string' }, object: { const: 'generation_session' }, title: { type: 'string' },
+            state: { type: 'string', enum: ['ready', 'uncertain'] }, busy: { type: 'boolean' }, active_job_id: { type: ['string', 'null'] },
+            turn_count: { type: 'integer' }, created_at: { type: 'string', format: 'date-time' }, updated_at: { type: 'string', format: 'date-time' } }
+        },
         ImageGenerationRequest: {
           type: 'object',
           required: ['prompt'],
           additionalProperties: false,
           properties: {
+            generation_session_id: { type: 'string', pattern: '^gs_[A-Za-z0-9_-]+$', description: 'Retain and continue one upstream session on its owning account. Turns execute exclusively. Interrupted turns mark the session uncertain and are not automatically retried.' },
             prompt: { type: 'string', minLength: 1, maxLength: 4000 },
             model: { type: 'string' },
             n: { type: 'integer', const: 1 },
@@ -480,6 +496,7 @@ function buildOpenApiSpec() {
           required: ['prompt'],
           additionalProperties: false,
           properties: {
+            generation_session_id: { type: 'string', pattern: '^gs_[A-Za-z0-9_-]+$', description: 'Retain and continue one upstream session on its owning account. Turns execute exclusively. Interrupted turns mark the session uncertain and are not automatically retried.' },
             prompt: { type: 'string', minLength: 1, maxLength: 4000 },
             model: { type: 'string' },
             aspect_ratio: { type: 'string', enum: ['16:9', '9:16', '1:1'], default: '16:9' },
@@ -496,6 +513,7 @@ function buildOpenApiSpec() {
           properties: {
             id: { type: 'string' },
             object: { const: 'job' },
+            generation_session_id: { type: ['string', 'null'] },
             type: { type: 'string', enum: ['image', 'video'] },
             status: { type: 'string', enum: ['queued', 'running', 'succeeded', 'failed', 'canceled'] },
             progress: { type: 'integer', minimum: 0, maximum: 100, description: 'Estimated completion percentage.' },

@@ -221,7 +221,7 @@ test('authentication failure renews the credential and reconnects without recurs
 
 function dispatcher(mocks = {}, globals = {}) {
   return isolated('src/services/dispatcher.js', {
-    '../models': {}, './pool': { pool: {} }, './storage': {}, './media': {}, './usage': { track() {} },
+    '../models': {}, './pool': { pool: {} }, './storage': {}, './media': {}, './generationSessions': {}, './usage': { track() {} },
     './webhook': { startWebhooks() {}, stopWebhooks() {}, dispatchJobEvent: async () => {} },
     '../serializers': { serializeJob: x => x }, ...mocks
   }, '', globals).Dispatcher;
@@ -601,4 +601,118 @@ test('NoiseFrameDecoder evicts stale or excessive partial frames and serializeAc
     { status: 'degraded', connected: false, is_renewing: true, active: { chat: 0, image: 0, video: 0 }, limits: { chat: 4, image: 2, video: 1 }, consecutive_failures: 1, cooldown_until: null }
   );
   assert.equal(serialized.live.is_renewing, true);
+});
+
+test('retained image/video turns use the supplied upstream session and never delete it on success', async () => {
+  for (const kind of ['image', 'video']) {
+    const c = client();
+    c.chat = async (_, options) => {
+      assert.equal(options.sessionId, A);
+      assert.equal(options.new_session, false);
+      return { sessionId: A, text: 'done', presentations: [{ kind, data: { [kind === 'image' ? 'images' : 'videos']: [{ path: `${kind}.bin` }] } }] };
+    };
+    c.readFile = async () => Buffer.from('media');
+    c.deleteSession = async () => assert.fail('Retained session was deleted');
+    const result = await c[kind === 'image' ? 'generateImage' : 'generateVideo']('next turn', { sessionId: A, retainSession: true });
+    assert.equal(result.sessionId, A);
+    assert.equal(result.success, true);
+  }
+});
+
+test('generation sessions enforce ownership, atomic exclusivity, account affinity and uncertainty', async () => {
+  const doc = { _id: 'gs_test', api_key_id: 'owner', session_id: A, account_id: null, state: 'ready', active_execution: null, turn_count: 0 };
+  function matches(filter) {
+    return Object.entries(filter).every(([key, value]) => key === '$or' ? value.some(matches) : doc[key] === value);
+  }
+  function update(changes) { Object.assign(doc, changes.$set || {}); for (const [key, n] of Object.entries(changes.$inc || {})) doc[key] += n; }
+  const model = {
+    findOne: filter => ({ lean: async () => matches(filter) ? { ...doc } : null }),
+    findOneAndUpdate: (filter, changes) => ({ lean: async () => { if (!matches(filter)) return null; update(changes); return { ...doc }; } }),
+    updateOne: async (filter, changes) => { if (!matches(filter)) return { matchedCount: 0 }; update(changes); return { matchedCount: 1 }; }
+  };
+  const sessions = isolated('src/services/generationSessions.js', { '../models/GenerationSession': { GenerationSession: model } });
+  const job = { _id: 'job_one', api_key_id: 'owner', generation_session_id: 'gs_test', execution_id: 'run_one' };
+  await assert.rejects(sessions.get('gs_test', 'foreign'), /resource_not_found/);
+  const [first, second] = await Promise.allSettled([sessions.lock(job), sessions.lock({ ...job, execution_id: 'run_two' })]);
+  assert.equal(first.status, 'fulfilled'); assert.equal(second.status, 'rejected');
+  await sessions.bind(job, 'account_one');
+  await assert.rejects(sessions.bind(job, 'account_two'), /conversation_unavailable/);
+  await sessions.finish({ ...job, execution_id: 'foreign_execution' }, true);
+  assert.equal(doc.active_execution, 'run_one');
+  await sessions.finish(job, true);
+  assert.equal(doc.turn_count, 1);assert.equal(doc.active_execution, null);assert.equal(doc.state, 'ready');
+  await sessions.lock(job);await sessions.bind(job, 'account_one');await sessions.finish(job, false);
+  assert.equal(doc.state, 'uncertain');
+  await assert.rejects(sessions.get('gs_test', 'owner'), /uncertain upstream turn/);
+  const publicDoc = sessions.serialize(doc);
+  assert.equal(publicDoc.session_id, undefined);assert.equal(publicDoc.account_id, undefined);assert.equal(publicDoc.api_key_id, undefined);
+});
+
+test('dispatcher pins a retained session and commits one turn after media succeeds', async () => {
+  const events = [];
+  const session = { session_id: A, account_id: 'pinned' };
+  const D = dispatcher({
+    './generationSessions': { lock: async () => session, bind: async (_, id) => events.push(['bind', id]), finish: async (_, success) => events.push(['finish', success]) },
+    '../models': { Job: { updateOne: async () => ({ matchedCount: 1 }), findOneAndUpdate: () => ({ lean: async () => ({ _id: 'job', status: 'succeeded', type: 'image' }) }) } },
+    './pool': { pool: { acquire: async (_, options) => {
+      assert.equal(options.preferredAccountId, 'pinned');
+      return { accountId: 'pinned', released: false, release() { this.released = true; }, client: { generateImage: async (_, options) => {
+        assert.equal(options.sessionId, A); assert.equal(options.retainSession, true);
+        return { success: true, sessionId: A, buffer: Buffer.from('image') };
+      } } };
+    } } },
+    './storage': { saveFile: async () => ({ _id: 'file' }) }
+  });
+  const d = new D();d._loadReferences = async () => ({});d._finalize = () => {};
+  await d._run({ _id: 'job', generation_session_id: 'gs_test', api_key_id: 'owner', execution_id: 'run', type: 'image', attempts: 1, max_attempts: 1 });
+  assert.deepEqual(events, [['bind', 'pinned'], ['finish', true]]);
+});
+
+test('a failed retained turn is marked uncertain without account failover or paid retry', async () => {
+  const finished = [];
+  const D = dispatcher({
+    './generationSessions': { lock: async () => ({ session_id: A, account_id: 'pinned' }), bind: async () => {}, finish: async (_, ok) => finished.push(ok) },
+    '../models': { Job: { updateOne: async () => ({ matchedCount: 1 }), findOneAndUpdate: () => ({ lean: async () => ({ _id: 'job', status: 'failed' }) }) } },
+    './pool': { pool: { hasAlternative: () => assert.fail('Retained turn must not fail over'), acquire: async () => ({ accountId: 'pinned', released: false, release() { this.released = true; }, client: { generateImage: async () => { throw new ApiError(ErrorCodes.UPSTREAM_ERROR); } } }) } }
+  });
+  const d = new D();d._loadReferences = async () => ({});d._finalize = () => {};
+  await d._run({ _id: 'job', generation_session_id: 'gs_test', api_key_id: 'owner', execution_id: 'run', type: 'image', attempts: 1, max_attempts: 2 });
+  assert.deepEqual(finished, [false]);
+});
+
+test('another turn in a busy generation session waits without acquiring an upstream slot', async () => {
+  let update;
+  const D = dispatcher({
+    './generationSessions': { lock: async () => { throw new ApiError(ErrorCodes.CONVERSATION_BUSY); } },
+    '../models': { Job: { updateOne: async (_, value) => { update = value; return { matchedCount: 1 }; } } },
+    './pool': { pool: { acquire: () => assert.fail('Busy session must wait before upstream work') } }
+  });
+  const d = new D();
+  await d._run({ _id: 'job', generation_session_id: 'gs_test', execution_id: 'run', type: 'video', attempts: 1, max_attempts: 1 });
+  assert.equal(update.$set.status, 'queued');
+  assert.equal(update.$inc.attempts, -1);
+  assert.ok(update.$set.session_wait_until > new Date());
+});
+
+test('retained media turns ignore replayed video presentations and history from the preceding user turn', async () => {
+  const c = client({ setTimeout: (fn, ms) => setTimeout(fn, [300, 1500, 2500, 3500].includes(ms) ? 2 : ms), setInterval: (fn, ms) => setInterval(fn, ms === 400 ? 5 : ms) });
+  const old = { kind: 'video', id: 'old-video', session_id: A, data: { videos: [{ path: 'old.mp4' }] } };
+  const fresh = { kind: 'video', id: 'new-video', session_id: A, data: { videos: [{ path: 'new.mp4' }] } };
+  let newTurnVisible = false;
+  c.sendRequest = async method => ({ status: 200, body: method === 'GET' ? JSON.stringify({ result: { chat_events: [
+    { role: 'user', display_text: 'previous request' }, { event_name: 'delta.presentation', payload: old },
+    ...(newTurnVisible ? [{ role: 'user', display_text: 'current request' }, { event_name: 'delta.presentation', payload: fresh }] : [])
+  ] } }) : '{}' });
+  let resolved = false;
+  const pending = c.chat('current request', { sessionId: A, waitForKind: 'video', timeout: 1000 }).then(result => { resolved = true; return result; });
+  await delay(5);
+  c.emit('presentation', old, 1);
+  c.emit('message_done', { session_id: A, presentations: [old] }, 2);
+  c.emit('agent_status', { session_id: A, activity_code: 'idle' }, 3);
+  await delay(25);
+  assert.equal(resolved, false);
+  newTurnVisible = true;
+  const result = await pending;
+  assert.equal(result.presentations.some(p => p.data?.videos?.[0]?.path === 'old.mp4'), false);
+  assert.equal(result.presentations.some(p => p.data?.videos?.[0]?.path === 'new.mp4'), true);
 });

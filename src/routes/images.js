@@ -23,6 +23,7 @@ const router = express.Router();
 const IMAGE_ASPECT_RATIOS = ['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3'];
 
 const imageRequestSchema = z.object({
+  generation_session_id: z.string().regex(/^gs_[A-Za-z0-9_-]+$/).optional(),
   prompt: z.string().trim().min(1).max(4000),
   model: z.string().max(64).optional(),
   n: z.literal(1).optional().describe('Only one image per request is supported.'),

@@ -19,6 +19,8 @@ const JobSchema = new mongoose.Schema(
     api_key_id: { type: String, required: true },
     status: { type: String, enum: JOB_STATUSES, default: 'queued' },
     prompt: { type: String, required: true, maxlength: 4000 },
+    generation_session_id: { type: String, default: null },
+    session_wait_until: { type: Date, default: null },
     params: {
       aspect_ratio: { type: String, default: null },
       duration: { type: Number, default: null },
