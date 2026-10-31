@@ -23,6 +23,7 @@ const VIDEO_ASPECT_RATIOS = ['16:9', '9:16', '1:1'];
 
 const videoRequestSchema = z
   .object({
+    generation_session_id: z.string().regex(/^gs_[A-Za-z0-9_-]+$/).optional(),
     prompt: z.string().trim().min(1).max(4000),
     model: z.string().max(64).optional(),
     aspect_ratio: z.enum(VIDEO_ASPECT_RATIOS).default('16:9'),

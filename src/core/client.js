@@ -1107,6 +1107,24 @@ class MuseClient extends EventEmitter {
     options.signal?.throwIfAborted();
     const onToken = typeof options === 'function' ? options : options.onToken;
     const onEvent = options.onEvent;
+    const mediaPaths = p => [p?.image_path, ...(p?.data?.images || []).map(x => x.path), ...(p?.data?.videos || []).map(x => x.path)].filter(Boolean);
+    const previousPaths = new Set();
+    let previousUserIndex = -1;
+    if (options.sessionId && options.waitForKind) {
+      const history = await this.sendRequest('GET', `/chat/history?session_id=${options.sessionId}`, null, [], false, null, { signal: options.signal });
+      if (history.status !== 200 && history.status !== 404) throw new Error('Could not establish the retained session turn boundary.');
+      if (history.status === 200 && history.body) {
+        const events = JSON.parse(history.body).result?.chat_events || [];
+        previousUserIndex = events.map(e => e.role === 'user' || e.event_name === 'message.user').lastIndexOf(true);
+        for (const event of events) {
+          const p = event.payload || event;
+          for (const presentation of [p, ...(p.presentations || [])]) {
+            for (const path of mediaPaths(presentation)) previousPaths.add(path);
+          }
+        }
+      }
+    }
+    const isCurrentMedia = p => !mediaPaths(p).some(path => previousPaths.has(path));
 
     return new Promise((resolve, reject) => {
       let fullResponse = '';
@@ -1117,10 +1135,10 @@ class MuseClient extends EventEmitter {
 
       const hasExpectedMedia = () => {
         if (options.waitForKind === 'video') {
-          return presentations.some(p => p.kind === 'video' || p.data?.videos?.length > 0);
+          return presentations.some(p => (p.kind === 'video' || p.data?.videos?.length > 0) && mediaPaths(p).length > 0);
         }
         if (options.waitForKind === 'image') {
-          return presentations.some(p => p.kind === 'image' || p.data?.images?.length > 0);
+          return presentations.some(p => (p.kind === 'image' || p.data?.images?.length > 0) && mediaPaths(p).length > 0);
         }
         return false;
       };
@@ -1236,7 +1254,7 @@ class MuseClient extends EventEmitter {
       const handlePresentation = (payload, seq) => {
         if (isDone || !isForSession(payload)) return;
         // Do not treat browser_task as a media presentation
-        if (payload?.kind === 'browser_task' || payload?.data?.browser_task_id) return;
+        if (payload?.kind === 'browser_task' || payload?.data?.browser_task_id || !isCurrentMedia(payload)) return;
 
         presentations.push(payload);
         emit('presentation', payload);
@@ -1300,7 +1318,7 @@ class MuseClient extends EventEmitter {
         // Extract any presentations from payload
         if (Array.isArray(payload?.presentations)) {
           for (const pres of payload.presentations) {
-            if (!presentations.some(p => p.id === pres.id || p.image_path === pres.image_path)) {
+            if (isCurrentMedia(pres) && !presentations.some(p => (p.id && p.id === pres.id) || (p.image_path && p.image_path === pres.image_path))) {
               presentations.push(pres);
               emit('presentation', pres);
             }
@@ -1339,20 +1357,21 @@ class MuseClient extends EventEmitter {
             
             // Find the LAST user message in this session
             const lastUserIdx = evs.map(e => e.role === 'user' || e.event_name === 'message.user').lastIndexOf(true);
+            if (options.sessionId && options.waitForKind && lastUserIdx <= previousUserIndex) return;
             const turnEvents = lastUserIdx !== -1 ? evs.slice(lastUserIdx + 1) : evs;
 
             // Extract any presentations from ALL turn events (including delta.presentation)
             for (const evItem of turnEvents) {
               const p = evItem.payload || evItem;
               if (evItem.event_name === 'delta.presentation' || p.kind === 'image' || p.kind === 'video' || p.data?.images?.length > 0 || p.data?.videos?.length > 0) {
-                if (!presentations.some(pr => (pr.id && pr.id === p.id) || (pr.image_path && pr.image_path === p.image_path) || (pr.data?.images?.[0]?.path && pr.data?.images?.[0]?.path === p.data?.images?.[0]?.path))) {
+                if (isCurrentMedia(p) && !presentations.some(pr => (pr.id && pr.id === p.id) || (pr.image_path && pr.image_path === p.image_path) || (pr.data?.images?.[0]?.path && pr.data?.images?.[0]?.path === p.data?.images?.[0]?.path))) {
                   presentations.push(p);
                   emit('presentation', p);
                 }
               }
               if (Array.isArray(p.presentations)) {
                 for (const pres of p.presentations) {
-                  if (!presentations.some(pr => (pr.id && pr.id === pres.id) || (pr.image_path && pr.image_path === pres.image_path))) {
+                  if (isCurrentMedia(pres) && !presentations.some(pr => (pr.id && pr.id === pres.id) || (pr.image_path && pr.image_path === pres.image_path))) {
                     presentations.push(pres);
                     emit('presentation', pres);
                   }
@@ -1645,8 +1664,8 @@ class MuseClient extends EventEmitter {
     }
 
     const chatResult = await this.chat(formattedPrompt, {
-      sessionId: null,
-      new_session: true,
+      sessionId: options.sessionId || null,
+      new_session: !options.sessionId,
       ref_image: refImage,
       ref_video: refVideo,
       timeout: options.timeout || 180000,
@@ -1662,7 +1681,7 @@ class MuseClient extends EventEmitter {
     // Find image presentation widget
     const imagePres = chatResult.presentations.find(p => p.kind === 'image' || p.data?.images?.length > 0);
     if (!imagePres) {
-      if (chatResult.sessionId) this.deleteSession(chatResult.sessionId).catch(() => {});
+      if (chatResult.sessionId && !options.retainSession) this.deleteSession(chatResult.sessionId).catch(() => {});
       return {
         success: false,
         text: chatResult.text,
@@ -1683,11 +1702,12 @@ class MuseClient extends EventEmitter {
         base64 = buffer.toString('base64');
       }
     } finally {
-      if (chatResult.sessionId) await this.deleteSession(chatResult.sessionId).catch(() => {});
+      if (chatResult.sessionId && !options.retainSession) await this.deleteSession(chatResult.sessionId).catch(() => {});
     }
 
     return {
       success: true,
+      sessionId: chatResult.sessionId,
       text: chatResult.text,
       prompt,
       path: imgPath,
@@ -1717,8 +1737,8 @@ class MuseClient extends EventEmitter {
     }
 
     const chatResult = await this.chat(formattedPrompt, {
-      sessionId: null,
-      new_session: true,
+      sessionId: options.sessionId || null,
+      new_session: !options.sessionId,
       ref_image: refImage,
       ref_video: refVideo,
       timeout: options.timeout || 180000,
@@ -1739,7 +1759,7 @@ class MuseClient extends EventEmitter {
     // Only this session's presentation/history may identify an output file.
 
     if (!vidPath) {
-      if (chatResult.sessionId) await this.deleteSession(chatResult.sessionId).catch(() => {});
+      if (chatResult.sessionId && !options.retainSession) await this.deleteSession(chatResult.sessionId).catch(() => {});
       return {
         success: false,
         text: chatResult.text,
@@ -1757,11 +1777,12 @@ class MuseClient extends EventEmitter {
         base64 = buffer.toString('base64');
       }
     } finally {
-      if (chatResult.sessionId) await this.deleteSession(chatResult.sessionId).catch(() => {});
+      if (chatResult.sessionId && !options.retainSession) await this.deleteSession(chatResult.sessionId).catch(() => {});
     }
 
     return {
       success: true,
+      sessionId: chatResult.sessionId,
       text: chatResult.text,
       prompt,
       path: vidPath,
