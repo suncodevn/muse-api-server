@@ -356,6 +356,7 @@ class Dispatcher extends EventEmitter {
         ? ctx.lease.client.generateVideo(job.prompt, {
           ref_image: references.image,
           ref_video: references.video,
+          ref_images: references.images,
           aspect_ratio: job.params?.aspect_ratio || undefined,
           duration: job.params?.duration || undefined,
           timeout,
@@ -446,6 +447,12 @@ class Dispatcher extends EventEmitter {
       }
     };
     if (job.reference?.image_file_id) refs.image = await load(job.reference.image_file_id, 'reference_image');
+    if (job.reference?.images?.length) {
+      refs.images = [];
+      for (const [index, item] of job.reference.images.entries()) {
+        refs.images.push({ image: await load(item.file_id, `reference_images.${index}.image`), label: item.label, role: item.role });
+      }
+    }
     if (job.reference?.video_file_id) refs.video = await load(job.reference.video_file_id, 'reference_video');
     return refs;
   }

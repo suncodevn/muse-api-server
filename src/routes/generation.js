@@ -47,7 +47,7 @@ function terminalError(job) {
  * @param {'image'|'video'} spec.type
  * @param {boolean} spec.sync                Wait for completion.
  * @param {object} spec.params               Job params (aspect_ratio, duration, response_format).
- * @param {{image?: string, video?: string}} spec.references  Raw reference values.
+ * @param {{image?: string, images?: Array<{image: string, label: string, role: string}>, video?: string}} spec.references  Raw reference values.
  * @param {(job: object, res: object) => Promise<void>|void} spec.onSucceeded  Sync success renderer.
  */
 async function submitGeneration(req, res, { type, sync, params, references, onSucceeded }) {
@@ -67,6 +67,18 @@ async function submitGeneration(req, res, { type, sync, params, references, onSu
     if (references.image) {
       const doc = await media.resolveReference(references.image, { expectedKind: 'image', apiKeyId: apiKey._id, param: 'reference_image' });
       reference.image_file_id = doc._id;
+    }
+    if (references.images) {
+      reference.images = [];
+      let totalBytes = 0;
+      for (const [index, item] of references.images.entries()) {
+        const doc = await media.resolveReference(item.image, { expectedKind: 'image', apiKeyId: apiKey._id, param: `reference_images.${index}.image` });
+        totalBytes += doc.bytes;
+        if (totalBytes > config.storage.maxImageBytes) {
+          throw new ApiError(ErrorCodes.REFERENCE_INVALID, { message: 'Combined reference images exceed the image byte limit.', param: 'reference_images' });
+        }
+        reference.images.push({ file_id: doc._id, label: item.label, role: item.role });
+      }
     }
     if (references.video) {
       const doc = await media.resolveReference(references.video, { expectedKind: 'video', apiKeyId: apiKey._id, param: 'reference_video' });

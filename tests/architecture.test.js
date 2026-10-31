@@ -602,3 +602,106 @@ test('NoiseFrameDecoder evicts stale or excessive partial frames and serializeAc
   );
   assert.equal(serialized.live.is_renewing, true);
 });
+
+test('multi-image video reaches chat in order with labels and repeated attachments', async () => {
+  const c = client();
+  const refs = ['first', 'second', 'first'].map((data, i) => ({ image: { mime_type: 'image/png', data_base64: data }, label: `label-${i}`, role: `role-${i}` }));
+  c.chat = async (prompt, options) => {
+    assert.deepEqual(Array.from(options.items, x => x.data_base64), ['first', 'second', 'first']);
+    assert.equal(options.preserveItemOrder, true);
+    assert.ok(prompt.indexOf('label-0') < prompt.indexOf('label-1'));
+    assert.match(prompt, /role-2/);
+    return { text: '', presentations: [{ kind: 'video', data: { videos: [{ path: 'own.mp4' }] } }] };
+  };
+  c.readFile = async () => Buffer.from('video');
+  assert.equal((await c.generateVideo('Both subjects together', { ref_images: refs })).success, true);
+});
+
+test('multi-image dispatcher loads owned files in order and fails closed on unavailable files', async () => {
+  const seen = [];
+  const D = dispatcher({
+    './storage': { getFileOrThrow: async (id, options) => { seen.push([id, options.apiKeyId]); if (id === 'foreign') throw Error('denied'); return { id }; } },
+    './media': { toUpstreamPayload: async doc => ({ data_base64: doc.id, mime_type: 'image/png' }) }
+  });
+  const d = new D();
+  const job = { api_key_id: 'owner', reference: { images: [{ file_id: 'b', label: 'B', role: 'subject' }, { file_id: 'a', label: 'A' }] } };
+  const refs = await d._loadReferences(job);
+  assert.deepEqual(seen, [['b', 'owner'], ['a', 'owner']]);
+  assert.equal(refs.images[0].label, 'B');
+  assert.equal(refs.images[1].image.data_base64, 'a');
+  job.reference.images[1].file_id = 'foreign';
+  await assert.rejects(d._loadReferences(job), /no longer available/);
+});
+
+test('multi-image submission preserves metadata, rejects total bytes, and replays before resolving', async () => {
+  let created, resolved = 0, replay = null;
+  const { submitGeneration } = isolated('src/routes/generation.js', {
+    '../services/dispatcher': { dispatcher: {
+      findIdempotentJob: async () => replay,
+      assertCanEnqueue: async () => {},
+      createJob: async spec => { created = spec; return { job: { _id: 'job', type: 'video' }, replayed: false }; }
+    } },
+    '../services/media': { resolveReference: async value => { resolved++; return { _id: value, bytes: value === 'large' ? config.storage.maxImageBytes : 1 }; } },
+    '../services/webhook': {}, '../serializers': { serializeJob: x => x }
+  });
+  const req = { valid: { body: { prompt: 'test' } }, auth: { apiKey: { _id: 'key' } }, get: () => undefined };
+  const res = { setHeader() {}, status() { return this; }, json(x) { return x; } };
+  const spec = { type: 'video', sync: false, params: {}, references: { images: [{ image: 'b', label: 'B', role: 'subject' }, { image: 'a', label: 'A', role: '' }] } };
+  await submitGeneration(req, res, spec);
+  assert.deepEqual(JSON.parse(JSON.stringify(created.reference.images)), [{ file_id: 'b', label: 'B', role: 'subject' }, { file_id: 'a', label: 'A', role: '' }]);
+  spec.references.images[0].image = 'large';
+  await assert.rejects(submitGeneration(req, res, spec), /Combined reference images/);
+  replay = { _id: 'old', type: 'video' };
+  const before = resolved;
+  assert.equal((await submitGeneration(req, res, spec))._id, 'old');
+  assert.equal(resolved, before);
+});
+
+test('multi-image schema rejects conflicting sources, unknown fields and invalid metadata', () => {
+  const router = isolated('src/routes/videos.js', {
+    '../middleware/auth': { requireScope: () => (req, res, next) => next() },
+    '../middleware/validate': { validate: () => (req, res, next) => next() },
+    '../middleware/errorHandler': { methodNotAllowed: () => () => {} },
+    './generation': {}, '../serializers': {}
+  }, '\nmodule.exports.schema = videoRequestSchema;');
+  const parse = body => router.schema.safeParse({ prompt: 'test', ...body }).success;
+  assert.equal(parse({ reference_images: [{ image: 'file_a' }, { image: 'file_b' }] }), true);
+  assert.equal(parse({ reference_image: 'file_a' }), true);
+  assert.equal(parse({ reference_images: Array(5).fill({ image: 'file_a' }) }), true);
+  for (const body of [
+    { reference_images: [] }, { reference_images: Array(101).fill({ image: 'x' }) },
+    { reference_images: [{ image: 'x', label: 'x'.repeat(121) }] },
+    { reference_images: [{ image: 'x', unexpected: 1 }] },
+    { reference_images: [{ image: 'x' }], reference_image: 'x' },
+    { reference_images: [{ image: 'x' }], reference_video: 'x' }
+  ]) assert.equal(parse(body), false);
+});
+
+test('multi-image idempotency fingerprints include content, order and metadata', () => {
+  const { requestFingerprint } = require('../src/routes/helpers');
+  const refs = [{ image: 'file_a', label: 'A' }, { image: 'file_b', role: 'scene' }];
+  const fingerprint = reference_images => requestFingerprint({ method: 'POST', baseUrl: '/v1/videos', path: '/generations', body: { prompt: 'test', reference_images } });
+  const original = fingerprint(refs);
+  assert.notEqual(original, fingerprint([...refs].reverse()));
+  assert.notEqual(original, fingerprint([{ ...refs[0], label: 'B' }, refs[1]]));
+  assert.notEqual(original, fingerprint([{ ...refs[0], image: 'file_c' }, refs[1]]));
+});
+
+test('video attachment list reaches upstream chat request without deduplicating positions', async () => {
+  const c = client({ setTimeout: (fn, ms) => setTimeout(fn, ms === 3500 ? 1 : ms) });
+  let sent;
+  c.sendRequest = async (method, path, body) => {
+    sent = body;
+    return { status: 200, body: '{}' };
+  };
+  const refs = ['a', 'b', 'a'].map(data_base64 => ({ type: 'image', mime_type: 'image/png', data_base64 }));
+  const pending = c.chat('use all images', { sessionId: A, items: refs, preserveItemOrder: true, timeout: 1000 });
+  await delay(2);
+  const payload = typeof sent === 'string' ? JSON.parse(sent) : sent;
+  assert.deepEqual(Array.from(payload.items.filter(x => x.type === 'image'), x => x.data_base64), ['a', 'b', 'a']);
+  c.emit('text_delta', 'done', { session_id: A }, 3);
+  c.emit('presentation', { kind: 'image', session_id: A, image_path: 'fixture.png' }, 4);
+  c.emit('event', { event: 'sessions.updated', session_id: A, payload: { session: { status: 'completed' }, change: 'updated' } });
+  c.emit('agent_status', { session_id: A, activity_code: 'idle' }, 5);
+  await pending;
+});

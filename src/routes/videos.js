@@ -28,14 +28,19 @@ const videoRequestSchema = z
     aspect_ratio: z.enum(VIDEO_ASPECT_RATIOS).default('16:9'),
     duration: z.number().int().min(3).max(10).default(5),
     reference_image: referenceSchema.optional(),
+    reference_images: z.array(z.object({
+      image: referenceSchema,
+      label: z.string().trim().max(120).default(''),
+      role: z.string().trim().max(240).default('')
+    }).strict()).min(1).max(100).optional(),
     reference_video: referenceSchema.optional(),
     async: z.boolean().default(true),
     webhook_url: z.string().max(2048).optional(),
     metadata: metadataSchema.optional()
   })
   .strict()
-  .refine((b) => !(b.reference_image && b.reference_video), {
-    message: 'Provide either reference_image or reference_video, not both',
+  .refine((b) => [b.reference_image, b.reference_images, b.reference_video].filter(Boolean).length <= 1, {
+    message: 'Provide only one of reference_image, reference_images or reference_video',
     path: ['reference_video']
   });
 
@@ -47,7 +52,7 @@ router
       type: 'video',
       sync: body.async === false,
       params: { aspect_ratio: body.aspect_ratio, duration: body.duration },
-      references: { image: body.reference_image, video: body.reference_video },
+      references: { image: body.reference_image, images: body.reference_images, video: body.reference_video },
       onSucceeded: (job, response) => response.status(200).json(serializeJob(job))
     });
   })
